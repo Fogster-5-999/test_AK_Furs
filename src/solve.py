@@ -298,7 +298,7 @@ def extract_payment_order_ids(purpose: str, existing_orders: set[int]) -> set[in
     for match in re.finditer(r"(?i)(?<![а-яёa-z])(?:a|а)\s*[-‐‑–—]?\s*0*(\d{1,4})(?!\d)", purpose):
         candidates.add(int(match.group(1)))
     contextual = re.compile(
-        r"(?i)(?:заказ(?:а|у|ом|е)?|зак\.?)"
+        r"(?i)(?:заказ(?:а|у|ом|е)?|зак\.?|сч[её]т(?:а|у|ом|е)?)"
         r"\s*(?:№|#|N[º°.]?)?\s*[-–—]?\s*0*(\d{1,4})(?!\d)"
     )
     candidates.update(int(match.group(1)) for match in contextual.finditer(purpose))
@@ -515,18 +515,16 @@ def q5_client_message(prices: dict[str, list[dict[str, Any]]], chats_dir: Path) 
     )
     if period is None:
         raise ValueError(f"No sable-vest price available on {chat_date}")
-    low = period["minimum"]
     high = period["recommended"]
     return (
         "Марина: Понимаю Вас — ехать через весь город, не зная бюджета, действительно "
-        "неудобно. Сразу сориентирую: жилеты из натурального соболя стоят "
-        f"примерно от {format_rub(low)} до {format_rub(high)} ₽; точная стоимость зависит "
-        f"от модели, длины и выбранной отделки. Это ориентир по прайсу на "
-        f"{chat_date.strftime('%d.%m.%Y')}."
-        " Если этот диапазон Вам подходит, с удовольствием заранее "
-        "подготовлю подходящие варианты и согласую удобное время. За один визит Вы "
-        "сможете примерить несколько моделей, сравнить мех и посадку, а также обсудить "
-        "индивидуальные мерки — без обязательства принимать решение сразу."
+        "неудобно. Жилет из натурального соболя — около "
+        f"{format_rub(high)} ₽. Точная стоимость зависит от модели и отделки. "
+        "Если Вам подходит такой ориентир, я заранее подготовлю несколько вариантов "
+        "и расскажу подробнее о каждом. На примерке Вы сможете сравнить модели и "
+        "обсудить посадку и индивидуальные мерки — без обязательства принимать решение "
+        "сразу. Подскажите, пожалуйста, хотели бы Вы сначала посмотреть фотографии "
+        "подходящих вариантов?"
     )
 
 
@@ -540,17 +538,26 @@ def json_number(value: Decimal) -> int | float:
     return int(rounded) if rounded == rounded.to_integral_value() else float(rounded)
 
 
-def write_outputs(data_dir: Path, output_dir: Path, template_path: Path) -> dict[str, Any]:
-    crm = read_crm(data_dir / "01_crm_orders_export.csv")
+def write_outputs(
+    data_dir: Path,
+    output_dir: Path,
+    template_path: Path,
+    *,
+    crm_path: Path | None = None,
+    bank_path: Path | None = None,
+    catalog_path: Path | None = None,
+    chats_dir: Path | None = None,
+) -> dict[str, Any]:
+    crm = read_crm(crm_path or data_dir / "01_crm_orders_export.csv")
     clean_rows = clean_crm(crm)
-    sheets = read_xlsx_sheets(data_dir / "03_catalog_prices_reference.xlsx")
+    sheets = read_xlsx_sheets(catalog_path or data_dir / "03_catalog_prices_reference.xlsx")
     prices, renames, manager_aliases = workbook_price_data(sheets)
 
     order_ids = {row["_order_id"] for row in clean_rows}
     incoming: list[tuple[dict[str, str], set[int], Decimal]] = []
     payment_audit: list[dict[str, str]] = []
     paid_orders: set[int] = set()
-    for payment in read_csv_dicts(data_dir / "02_bank_statement_rub.csv", "cp1251"):
+    for payment in read_csv_dicts(bank_path or data_dir / "02_bank_statement_rub.csv", "cp1251"):
         if payment.get("Тип", "").strip().casefold() != "поступление":
             continue
         amount = parse_decimal(payment.get("Сумма", ""), field="bank payment amount")
@@ -608,7 +615,7 @@ def write_outputs(data_dir: Path, output_dir: Path, template_path: Path) -> dict
     if unknown_managers:
         raise ValueError(f"Unmapped manager aliases in price violations: {dict(unknown_managers)}")
 
-    chats_dir = data_dir / "chats"
+    chats_dir = chats_dir or data_dir / "chats"
     chat_files = sorted(chats_dir.glob("C*.txt"))
     if len(chat_files) != 150:
         raise ValueError(f"Expected 150 chat files in {chats_dir}, found {len(chat_files)}")
@@ -634,13 +641,14 @@ def write_outputs(data_dir: Path, output_dir: Path, template_path: Path) -> dict
         "q3_price_violation_lines_total": sum(violations_by_manager.values()),
         "q3_price_violation_lines_by_manager": dict(sorted(violations_by_manager.items())),
         "q4_chats_meeting_before_price": q4_ids,
-        "run_command": "python src\\solve.py",
+        "run_command": "python src/solve.py",
         "notes": (
             "Дубли строк удалены по паре «номер заказа + № строки» с выбором наиболее поздней "
             "выгрузки; серийные Excel-даты преобразованы в календарные. Платёж считается "
             "связанным только при наличии в назначении ровно одного явного существующего номера "
-            "заказа или кода A-...; номер счёта, дата и сумма сами по себе не считаются номером "
-            "заказа. Платежи с несколькими кандидатами не связываются и включаются в неопознанные "
+            "заказа, кода A-... или номера счёта с формулировками «счёт/счёту/счёта»; "
+            "дата и сумма сами по себе не считаются номером заказа. Платежи с несколькими "
+            "кандидатами не связываются и включаются в неопознанные "
             "и output/bank_payment_audit.csv для ручной проверки. Старые артикулы "
             "сопоставлены с новыми по справочнику; дата перехода проверяется на наличие цены "
             "для нового артикула. Цены выбраны по включительным границам интервала. В Q4 "
@@ -660,23 +668,17 @@ def write_outputs(data_dir: Path, output_dir: Path, template_path: Path) -> dict
     answers_path = output_dir / "answers.json"
     answers_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    recommendation = max(violations_by_manager.items(), key=lambda item: item[1])[0] \
-        if violations_by_manager else "менеджерами"
     memo = (
         "# Записка руководителю\n\n"
-        f"1. После удаления повторных выгрузок осталось **{result['q1_unique_orders']} заказов** "
-        f"и **{result['q1_unique_order_lines']} строк**.\n"
-        f"2. В выписке не удалось связать с заказом **{len(unidentified)} поступлений** "
-        f"на **{format_rub(unidentified_total)} ₽**. Такие платежи требуют ручной проверки "
-        "по плательщику и дате.\n"
-        f"3. Среди заказов, отмеченных в CRM как оплаченные, **{len(result['q2a_paid_orders_without_payment'])}** "
-        "не имеют найденного поступления в этой выписке. Также выявлено "
-        f"**{result['q3_price_violation_lines_total']} строк** с ценой ниже установленного минимума; "
-        f"расчётная разница до минимальной цены — **{format_rub(violation_shortfall)} ₽**.\n\n"
-        "**Рекомендации.** (1) Ежедневно сверять поступления и заказы, а неидентифицированные "
-        "платежи направлять ответственному на разбор до закрытия смены. (2) Перед подтверждением "
-        "скидки проверять итоговую цену каждой позиции по действующему минимуму; отдельно "
-        f"разобрать случаи по менеджеру «{recommendation}».\n"
+        f"1. **Ценовая политика:** {result['q3_price_violation_lines_total']} строк с ценой "
+        f"ниже минимальной; расчётное отклонение от минимума — "
+        f"**{format_rub(violation_shortfall)} ₽**. Это оценка расхождения, а не доказанный убыток.\n"
+        f"2. **Сверка платежей:** {len(unidentified)} неопознанных поступлений на "
+        f"**{format_rub(unidentified_total)} ₽** требуют проверки по назначению и плательщику.\n"
+        f"3. **Подтверждение оплат:** у {len(result['q2a_paid_orders_without_payment'])} заказов, "
+        "помеченных в CRM как оплаченные, не найдено соответствующее поступление в выписке.\n\n"
+        "**Рекомендации:** регулярно разбирать неопознанные поступления и до подтверждения "
+        "скидки проверять цену позиции по действующему минимуму."
     )
     (output_dir / "management_memo.md").write_text(memo, encoding="utf-8")
 
@@ -707,8 +709,9 @@ def write_outputs(data_dir: Path, output_dir: Path, template_path: Path) -> dict
 
     validation_notes = (
         "# Проверка и допущения\n\n"
-        "Банковские строки читаются в CP1251; строки с назначением вида «счёт №...», "
-        "«по счёту №...» не связываются с заказом без отдельного номера заказа. Для Q4 "
+        "Банковские строки читаются в CP1251. Номер после «счёт/счёта/счёту/счётом» "
+        "считается номером заказа, если он совпадает с существующим заказом в CRM; дата "
+        "и сумма сами по себе для сопоставления не используются. Для Q4 "
         "в output/q4_chat_audit.csv записаны первые менеджерские приглашение и озвучивание "
         "цены с временными метками, номерами строк и исходным текстом. Если первое приглашение "
         "и первая цена имеют одинаковую временную метку, чат помечается неоднозначным независимо "
@@ -718,8 +721,8 @@ def write_outputs(data_dir: Path, output_dir: Path, template_path: Path) -> dict
         "В output/bank_payment_audit.csv сохранены назначения и кандидаты для каждой оплаты; "
         "при нескольких найденных заказах платёж не привязывается автоматически. Проверяйте эти реплики "
         "для пограничных формулировок: эвристический поиск по тексту не заменяет ручную "
-        "проверку. Ответ для C0010 использует исторический диапазон прайса на дату чата "
-        f"({chat_first_timestamp(chats_dir / 'C0010.txt').strftime('%d.%m.%Y')}); "
+        "проверку. Для ответа C0010 используется рекомендованная цена из исторического прайса, "
+        "действовавшая на дату чата; "
         "CRM-заказ, созданный позднее переписки, "
         "в сообщение не включается. Пустые и некорректные обязательные числовые поля приводят "
         "к ошибке вместо подстановки нуля. Исходные файлы не изменяются."
@@ -746,14 +749,27 @@ def main() -> int:
         help="directory containing the source files (default: ./Initial project data)",
     )
     parser.add_argument("--output", type=Path, help="directory for generated files")
+    parser.add_argument("--crm", type=Path, help="CRM CSV path (overrides data_dir default)")
+    parser.add_argument("--bank", type=Path, help="bank statement CSV path")
+    parser.add_argument("--catalog", type=Path, help="catalog and price history XLSX path")
+    parser.add_argument("--template", type=Path, help="answers JSON template path")
+    parser.add_argument("--chats", type=Path, help="directory containing chat TXT files")
     args = parser.parse_args()
     script_dir = Path(__file__).resolve().parent
     root = script_dir if (script_dir / "Initial project data").is_dir() else script_dir.parent
     data_dir = (args.data_dir or root / "Initial project data").resolve()
     output_dir = (args.output or root / "output").resolve()
-    template_path = data_dir / "answers_template.json"
+    template_path = (args.template or data_dir / "answers_template.json").resolve()
     try:
-        result = write_outputs(data_dir, output_dir, template_path)
+        result = write_outputs(
+            data_dir,
+            output_dir,
+            template_path,
+            crm_path=args.crm.resolve() if args.crm else None,
+            bank_path=args.bank.resolve() if args.bank else None,
+            catalog_path=args.catalog.resolve() if args.catalog else None,
+            chats_dir=args.chats.resolve() if args.chats else None,
+        )
     except (OSError, ValueError, KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

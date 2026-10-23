@@ -35,7 +35,19 @@ class SolveTests(unittest.TestCase):
         existing = {828, 243}
         self.assertEqual(
             solve.extract_payment_order_ids("по счету №828 от 13.12.2025", existing),
-            set(),
+            {828},
+        )
+        self.assertEqual(
+            solve.extract_payment_order_ids("Счёт № 00828", existing),
+            {828},
+        )
+        self.assertEqual(
+            solve.extract_payment_order_ids("Оплата по счёту 828", existing),
+            {828},
+        )
+        self.assertEqual(
+            solve.extract_payment_order_ids("Предоплата по счету №243", existing),
+            {243},
         )
         self.assertEqual(
             solve.extract_payment_order_ids("Оплата заказа A-00243", existing),
@@ -143,6 +155,16 @@ class SolveTests(unittest.TestCase):
         latest = max(prices["SOB-ZH-01"], key=lambda item: item["from"])
         self.assertEqual(on_chat_date, Decimal(199000))
         self.assertNotEqual(on_chat_date, latest["minimum"])
+
+    def test_c0010_reply_uses_recommended_price_without_internal_details(self) -> None:
+        data_dir = Path(__file__).resolve().parents[1] / "Initial project data"
+        sheets = solve.read_xlsx_sheets(data_dir / "03_catalog_prices_reference.xlsx")
+        prices, _, _ = solve.workbook_price_data(sheets)
+        message = solve.q5_client_message(prices, data_dir / "chats")
+        self.assertIn("234 000 ₽", message)
+        self.assertNotIn("199 000 ₽", message)
+        self.assertNotIn("прайс на", message)
+        self.assertNotIn("04.09.2025", message)
 
 
 if __name__ == "__main__":
