@@ -1,0 +1,18 @@
+{
+ "q1_unique_orders": 0,
+ "q1_unique_order_lines": 0,
+ "q2a_paid_orders_without_payment": [
+  "номера заказов числами, например 75"
+ ],
+ "q2b_unidentified_payments_count": 0,
+ "q2b_unidentified_payments_sum_rub": 0,
+ "q3_price_violation_lines_total": 0,
+ "q3_price_violation_lines_by_manager": {
+  "Каноническое имя": 0
+ },
+ "q4_chats_meeting_before_price": [
+  "ID чатов, например C0001"
+ ],
+ "run_command": "команда, которой пересчитываются все ответы из сырых файлов",
+ "notes": "Ваши толкования неясных правил"
+}
