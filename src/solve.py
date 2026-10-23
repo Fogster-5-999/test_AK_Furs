@@ -134,8 +134,12 @@ def parse_decimal(value: Any, *, field: str = "numeric value") -> Decimal:
 
 
 def order_id(value: Any) -> int | None:
-    match = re.search(r"\d+", str(value or ""))
-    return int(match.group()) if match else None
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(?:(?:a|а)\s*[-‐‑–—]?\s*)?0*(\d+)", text, re.IGNORECASE)
+    if not match:
+        return None
+    number = int(match.group(1))
+    return number if number > 0 else None
 
 
 def status_name(value: str) -> str:
@@ -278,17 +282,14 @@ def manager_key(value: str) -> str:
 def manager_names(rows: list[dict[str, str]]) -> dict[str, str]:
     alias_to_canonical: dict[str, str] = {}
     for row in rows:
-        values = list(row.values())
-        nonempty = [value.strip() for value in values if value.strip()]
-        if len(nonempty) < 2:
+        canonical = row.get("Каноническое имя", "").strip()
+        alias_text = row.get("Варианты написания в CRM", "").strip()
+        if not canonical:
             continue
-        canonical = nonempty[0]
-        aliases = nonempty[1:]
         alias_to_canonical[manager_key(canonical)] = canonical
-        for alias in aliases:
-            for name in re.split(r"[;,|/]", alias):
-                if name.strip():
-                    alias_to_canonical[manager_key(name)] = canonical
+        for name in re.split(r"[;,|/]", alias_text):
+            if name.strip():
+                alias_to_canonical[manager_key(name)] = canonical
     return alias_to_canonical
 
 
@@ -302,6 +303,10 @@ def extract_payment_order_ids(purpose: str, existing_orders: set[int]) -> set[in
     )
     candidates.update(int(match.group(1)) for match in contextual.finditer(purpose))
     return candidates & existing_orders
+
+
+def unique_payment_order_id(candidates: set[int]) -> int | None:
+    return next(iter(candidates)) if len(candidates) == 1 else None
 
 
 def amount_after_discount(row: dict[str, Any]) -> tuple[Decimal, Decimal]:
@@ -444,13 +449,11 @@ INVITATION_RE = re.compile(
 )
 
 
-def analyze_chat(path: Path) -> dict[str, str | bool]:
+def analyze_chat(path: Path) -> dict[str, str | bool | int]:
     chat_id = path.stem
-    first_price: datetime | None = None
-    first_invite: datetime | None = None
-    price_text = ""
-    invite_text = ""
-    for line in path.read_text(encoding="utf-8-sig").splitlines():
+    price_events: list[tuple[datetime, int, str]] = []
+    invitation_events: list[tuple[datetime, int, str]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), start=1):
         match = re.match(r"^\[(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2})\]\s*([^:]+):\s*(.*)$", line)
         if not match:
             continue
@@ -460,20 +463,36 @@ def analyze_chat(path: Path) -> dict[str, str | bool]:
         timestamp = datetime.strptime(match.group(1), "%d.%m.%Y %H:%M")
         message = match.group(3)
         if author == "менеджер":
-            if first_price is None and manager_mentioned_price(message):
-                first_price = timestamp
-                price_text = message
-            if first_invite is None and INVITATION_RE.search(message):
-                first_invite = timestamp
-                invite_text = message
-    violation = first_invite is not None and (first_price is None or first_invite < first_price)
+            if manager_mentioned_price(message):
+                price_events.append((timestamp, line_number, message))
+            if INVITATION_RE.search(message):
+                invitation_events.append((timestamp, line_number, message))
+
+    first_price = min(price_events, key=lambda event: (event[0], event[1])) if price_events else None
+    first_invite = min(invitation_events, key=lambda event: (event[0], event[1])) if invitation_events else None
+    ambiguous = bool(
+        first_invite and first_price
+        and first_invite[0] == first_price[0]
+    )
+    violation = bool(
+        first_invite and not ambiguous
+        and (
+            first_price is None
+            or (first_invite[0], first_invite[1]) < (first_price[0], first_price[1])
+        )
+    )
     return {
         "chat_id": chat_id,
         "violation": violation,
-        "first_invitation_at": first_invite.isoformat(sep=" ") if first_invite else "",
-        "first_invitation_text": invite_text,
-        "first_price_at": first_price.isoformat(sep=" ") if first_price else "",
-        "first_price_text": price_text,
+        "ambiguous": ambiguous,
+        "ambiguity_reason": "приглашение и озвучивание цены имеют одинаковую временную метку"
+        if ambiguous else "",
+        "first_invitation_at": first_invite[0].isoformat(sep=" ") if first_invite else "",
+        "first_invitation_line": first_invite[1] if first_invite else 0,
+        "first_invitation_text": first_invite[2] if first_invite else "",
+        "first_price_at": first_price[0].isoformat(sep=" ") if first_price else "",
+        "first_price_line": first_price[1] if first_price else 0,
+        "first_price_text": first_price[2] if first_price else "",
     }
 
 
@@ -529,6 +548,7 @@ def write_outputs(data_dir: Path, output_dir: Path, template_path: Path) -> dict
 
     order_ids = {row["_order_id"] for row in clean_rows}
     incoming: list[tuple[dict[str, str], set[int], Decimal]] = []
+    payment_audit: list[dict[str, str]] = []
     paid_orders: set[int] = set()
     for payment in read_csv_dicts(data_dir / "02_bank_statement_rub.csv", "cp1251"):
         if payment.get("Тип", "").strip().casefold() != "поступление":
@@ -538,10 +558,25 @@ def write_outputs(data_dir: Path, output_dir: Path, template_path: Path) -> dict
             raise ValueError(f"Incoming payment cannot be negative: {payment!r}")
         linked = extract_payment_order_ids(payment.get("Назначение платежа", ""), order_ids)
         incoming.append((payment, linked, amount))
-        paid_orders.update(linked)
+        matched_order = unique_payment_order_id(linked)
+        if matched_order is not None:
+            paid_orders.add(matched_order)
+            status = "matched"
+        elif len(linked) > 1:
+            status = "ambiguous"
+        else:
+            status = "unidentified"
+        payment_audit.append({
+            "date": payment.get("Дата операции", ""),
+            "amount": payment.get("Сумма", ""),
+            "counterparty": payment.get("Контрагент", ""),
+            "purpose": payment.get("Назначение платежа", ""),
+            "candidate_order_ids": ",".join(map(str, sorted(linked))),
+            "status": status,
+        })
 
     paid_crm_orders = {row["_order_id"] for row in clean_rows if row["_status"] == "Оплачен"}
-    unidentified = [item for item in incoming if not item[1]]
+    unidentified = [item for item in incoming if len(item[1]) != 1]
     unidentified_total = sum((item[2] for item in unidentified), ZERO)
 
     violations: list[tuple[str, Decimal]] = []
@@ -603,12 +638,17 @@ def write_outputs(data_dir: Path, output_dir: Path, template_path: Path) -> dict
         "notes": (
             "Дубли строк удалены по паре «номер заказа + № строки» с выбором наиболее поздней "
             "выгрузки; серийные Excel-даты преобразованы в календарные. Платёж считается "
-            "связанным только при наличии в назначении явного номера заказа или кода A-...; "
-            "номер счёта, дата и сумма сами по себе не считаются номером заказа. Старые артикулы "
+            "связанным только при наличии в назначении ровно одного явного существующего номера "
+            "заказа или кода A-...; номер счёта, дата и сумма сами по себе не считаются номером "
+            "заказа. Платежи с несколькими кандидатами не связываются и включаются в неопознанные "
+            "и output/bank_payment_audit.csv для ручной проверки. Старые артикулы "
             "сопоставлены с новыми по справочнику; дата перехода проверяется на наличие цены "
             "для нового артикула. Цены выбраны по включительным границам интервала. В Q4 "
-            "учитываются только реплики менеджера, а первые найденные события сохраняются в "
-            "output/q4_chat_audit.csv для проверки. Для ответа C0010 используется прайс на дату "
+            "учитываются только реплики менеджера. Если первые приглашение и цена имеют одинаковую "
+            "временную метку, чат помечается неоднозначным независимо от порядка строк и не считается "
+            "подтверждённым нарушением; номера строк сохраняются для проверки в "
+            "output/q4_chat_audit.csv. Приглашение без озвученной до конца переписки цены "
+            "считается приглашением до цены. Для ответа C0010 используется прайс на дату "
             "переписки, без данных о более позднем заказе. Скидка в процентах применяется к "
             "сумме строки, скидка без «%» вычитается из суммы всей строки."
         ),
@@ -642,12 +682,24 @@ def write_outputs(data_dir: Path, output_dir: Path, template_path: Path) -> dict
 
     client_message = q5_client_message(prices, chats_dir)
     (output_dir / "client_message_C0010.txt").write_text(client_message + "\n", encoding="utf-8")
+    with (output_dir / "bank_payment_audit.csv").open(
+        "w", encoding="utf-8-sig", newline="",
+    ) as audit_file:
+        writer = csv.DictWriter(
+            audit_file,
+            fieldnames=[
+                "date", "amount", "counterparty", "purpose", "candidate_order_ids", "status",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(payment_audit)
     with (output_dir / "q4_chat_audit.csv").open("w", encoding="utf-8-sig", newline="") as audit_file:
         writer = csv.DictWriter(
             audit_file,
             fieldnames=[
-                "chat_id", "violation", "first_invitation_at", "first_invitation_text",
-                "first_price_at", "first_price_text",
+                "chat_id", "violation", "ambiguous", "ambiguity_reason",
+                "first_invitation_at", "first_invitation_line", "first_invitation_text",
+                "first_price_at", "first_price_line", "first_price_text",
             ],
         )
         writer.writeheader()
@@ -657,8 +709,14 @@ def write_outputs(data_dir: Path, output_dir: Path, template_path: Path) -> dict
         "# Проверка и допущения\n\n"
         "Банковские строки читаются в CP1251; строки с назначением вида «счёт №...», "
         "«по счёту №...» не связываются с заказом без отдельного номера заказа. Для Q4 "
-        "в output/q4_chat_audit.csv записаны первые найденные менеджерские приглашение и "
-        "озвучивание цены с временными метками и исходным текстом. Проверяйте эти реплики "
+        "в output/q4_chat_audit.csv записаны первые менеджерские приглашение и озвучивание "
+        "цены с временными метками, номерами строк и исходным текстом. Если первое приглашение "
+        "и первая цена имеют одинаковую временную метку, чат помечается неоднозначным независимо "
+        "от порядка сообщений; номера строк оставлены для ручной проверки. "
+        "Если менеджер приглашает, но не озвучивает цену до конца переписки, чат отмечается "
+        "как приглашение до цены. "
+        "В output/bank_payment_audit.csv сохранены назначения и кандидаты для каждой оплаты; "
+        "при нескольких найденных заказах платёж не привязывается автоматически. Проверяйте эти реплики "
         "для пограничных формулировок: эвристический поиск по тексту не заменяет ручную "
         "проверку. Ответ для C0010 использует исторический диапазон прайса на дату чата "
         f"({chat_first_timestamp(chats_dir / 'C0010.txt').strftime('%d.%m.%Y')}); "
@@ -677,6 +735,7 @@ def write_outputs(data_dir: Path, output_dir: Path, template_path: Path) -> dict
     print(f"Created {output_dir / 'client_message_C0010.txt'}", file=sys.stderr)
     print(f"Created {output_dir / 'ai_validation_notes.md'}", file=sys.stderr)
     print(f"Created {output_dir / 'q4_chat_audit.csv'}", file=sys.stderr)
+    print(f"Created {output_dir / 'bank_payment_audit.csv'}", file=sys.stderr)
     return result
 
 
