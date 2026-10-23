@@ -95,12 +95,12 @@ def excel_datetime(value: Any) -> datetime | None:
     return datetime.combine(parsed, datetime.min.time()) if parsed else None
 
 
-def parse_decimal(value: Any) -> Decimal:
+def parse_decimal(value: Any, *, field: str = "numeric value") -> Decimal:
     if value is None:
-        return ZERO
+        raise ValueError(f"Missing {field}")
     text = str(value).strip().replace("\u00a0", "").replace(" ", "")
     if not text:
-        return ZERO
+        raise ValueError(f"Missing {field}")
     text = re.sub(r"(?i)(руб(?:\.|лей|ля|ль)?|rur|rub|₽)", "", text)
     text = text.replace("−", "-")
     multiplier = Decimal(1)
@@ -111,7 +111,7 @@ def parse_decimal(value: Any) -> Decimal:
         text = text[:suffix.start()]
     text = re.sub(r"[^\d,.\-+]", "", text)
     if not text or text in {"+", "-", ".", ","}:
-        return ZERO
+        raise ValueError(f"Invalid {field}: {value!r}")
     comma, dot = text.rfind(","), text.rfind(".")
     sep = max(comma, dot)
     if comma >= 0 and dot >= 0:
@@ -130,7 +130,7 @@ def parse_decimal(value: Any) -> Decimal:
     try:
         return Decimal(normalized) * multiplier
     except InvalidOperation as exc:
-        raise ValueError(f"Cannot parse numeric value: {value!r}") from exc
+        raise ValueError(f"Cannot parse {field}: {value!r}") from exc
 
 
 def order_id(value: Any) -> int | None:
@@ -297,7 +297,7 @@ def extract_payment_order_ids(purpose: str, existing_orders: set[int]) -> set[in
     for match in re.finditer(r"(?i)(?<![а-яёa-z])(?:a|а)\s*[-‐‑–—]?\s*0*(\d{1,4})(?!\d)", purpose):
         candidates.add(int(match.group(1)))
     contextual = re.compile(
-        r"(?i)(?:заказ(?:а|у|ом|е)?|зак\.?|сч[её]т(?:а|у|ом|е)?)"
+        r"(?i)(?:заказ(?:а|у|ом|е)?|зак\.?)"
         r"\s*(?:№|#|N[º°.]?)?\s*[-–—]?\s*0*(\d{1,4})(?!\d)"
     )
     candidates.update(int(match.group(1)) for match in contextual.finditer(purpose))
@@ -310,16 +310,20 @@ def amount_after_discount(row: dict[str, Any]) -> tuple[Decimal, Decimal]:
     if not discount_text:
         return row["_unit_price"], gross
     if "%" in discount_text:
-        percent = parse_decimal(discount_text.replace("%", ""))
+        percent = parse_decimal(discount_text.replace("%", ""), field="discount percentage")
+        if percent < ZERO or percent > Decimal(100):
+            raise ValueError(f"Discount percentage out of range: {discount_text!r}")
         discount_amount = gross * percent / Decimal(100)
     else:
-        discount_amount = parse_decimal(discount_text)
+        discount_amount = parse_decimal(discount_text, field="line discount")
+    if discount_amount < ZERO or discount_amount > gross:
+        raise ValueError(f"Discount exceeds line amount: {discount_text!r}")
     net = gross - discount_amount
     return net / row["_quantity"], net
 
 
 def workbook_price_data(sheets: dict[str, list[list[str]]]) -> tuple[
-        dict[str, list[dict[str, Any]]], dict[str, str], dict[str, str], list[str]]:
+        dict[str, list[dict[str, Any]]], dict[str, tuple[str, date]], dict[str, str]]:
     price_rows = table_from_sheet(
         sheets["Прайс_история"],
         {"Артикул", "Действует с", "Действует по", "Минимально допустимая цена, ₽"},
@@ -333,31 +337,50 @@ def workbook_price_data(sheets: dict[str, list[list[str]]]) -> tuple[
         prices[row["Артикул"].strip()].append({
             "from": start,
             "to": end,
-            "minimum": parse_decimal(row["Минимально допустимая цена, ₽"]),
-            "recommended": parse_decimal(row.get("Рекомендованная цена, ₽", "")),
+            "minimum": parse_decimal(row["Минимально допустимая цена, ₽"],
+                                     field=f"minimum price for {row['Артикул']}"),
+            "recommended": parse_decimal(row["Рекомендованная цена, ₽"],
+                                         field=f"recommended price for {row['Артикул']}"),
         })
+        if end is not None and end < start:
+            raise ValueError(f"Price period ends before it starts for {row['Артикул']}")
+        if prices[row["Артикул"].strip()][-1]["minimum"] <= ZERO:
+            raise ValueError(f"Minimum price must be positive for {row['Артикул']}")
+    for article, periods in prices.items():
+        periods.sort(key=lambda period: period["from"])
+        for previous, current in zip(periods, periods[1:]):
+            if previous["to"] is None or previous["to"] >= current["from"]:
+                raise ValueError(f"Overlapping price periods for {article}")
     rename_rows = table_from_sheet(
         sheets["Переименования"], {"Старый артикул", "Новый артикул", "Дата перехода"},
     )
-    renames: dict[str, str] = {}
+    renames: dict[str, tuple[str, date]] = {}
     for row in rename_rows:
         old, new = row["Старый артикул"].strip(), row["Новый артикул"].strip()
-        renames[old] = new
         transition = excel_date(row["Дата перехода"])
         if transition is None:
             raise ValueError(f"Invalid article transition date: {old} -> {new}")
+        if old in renames:
+            raise ValueError(f"Duplicate article rename for {old}")
+        renames[old] = (new, transition)
+        if not any(period["from"] <= transition and
+                   (period["to"] is None or transition <= period["to"])
+                   for period in prices.get(new, [])):
+            raise ValueError(f"No historical price for {new} on transition date {transition}")
     manager_rows = table_from_sheet(sheets["Менеджеры"], {"Каноническое имя"})
     manager_aliases = manager_names(manager_rows)
     return prices, renames, manager_aliases
 
 
 def find_minimum_price(article: str, when: date, prices: dict[str, list[dict[str, Any]]],
-                       renames: dict[str, str]) -> Decimal | None:
-    canonical = renames.get(article, article)
-    for period in prices.get(canonical, []):
-        if period["from"] <= when and (period["to"] is None or when <= period["to"]):
-            return period["minimum"]
-    return None
+                       renames: dict[str, tuple[str, date]]) -> Decimal | None:
+    rename = renames.get(article)
+    canonical = rename[0] if rename else article
+    matches = [period for period in prices.get(canonical, [])
+               if period["from"] <= when and (period["to"] is None or when <= period["to"])]
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous historical price for {article} on {when}")
+    return matches[0]["minimum"] if matches else None
 
 
 def parse_russian_number_words(text: str) -> tuple[Decimal | None, bool]:
@@ -421,10 +444,12 @@ INVITATION_RE = re.compile(
 )
 
 
-def analyze_chat(path: Path) -> tuple[str, bool]:
+def analyze_chat(path: Path) -> dict[str, str | bool]:
     chat_id = path.stem
     first_price: datetime | None = None
     first_invite: datetime | None = None
+    price_text = ""
+    invite_text = ""
     for line in path.read_text(encoding="utf-8-sig").splitlines():
         match = re.match(r"^\[(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2})\]\s*([^:]+):\s*(.*)$", line)
         if not match:
@@ -437,33 +462,49 @@ def analyze_chat(path: Path) -> tuple[str, bool]:
         if author == "менеджер":
             if first_price is None and manager_mentioned_price(message):
                 first_price = timestamp
+                price_text = message
             if first_invite is None and INVITATION_RE.search(message):
                 first_invite = timestamp
-    return chat_id, first_invite is not None and (first_price is None or first_invite < first_price)
+                invite_text = message
+    violation = first_invite is not None and (first_price is None or first_invite < first_price)
+    return {
+        "chat_id": chat_id,
+        "violation": violation,
+        "first_invitation_at": first_invite.isoformat(sep=" ") if first_invite else "",
+        "first_invitation_text": invite_text,
+        "first_price_at": first_price.isoformat(sep=" ") if first_price else "",
+        "first_price_text": price_text,
+    }
 
 
-def q5_client_message(prices: dict[str, list[dict[str, Any]]],
-                      clean_rows: list[dict[str, Any]]) -> str:
-    vest_sku = "SOB-ZH-01"
-    latest = max(prices[vest_sku], key=lambda item: item["from"])
-    low = latest["minimum"]
-    high = latest["recommended"]
-    matching = [row for row in clean_rows if row["_order_id"] == 702 and row["Артикул"].strip() == vest_sku]
-    order_detail = ""
-    if matching:
-        unit_after_discount, _ = amount_after_discount(matching[0])
-        base_price = matching[0]["_unit_price"]
-        order_detail = (
-            f" По Вашему выбранному варианту в заказе указана стоимость "
-            f"{format_rub(base_price)} ₽; с учётом согласованной скидки — "
-            f"{format_rub(unit_after_discount)} ₽."
-        )
+def chat_first_timestamp(path: Path) -> datetime:
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        match = re.match(r"^\[(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2})\]", line)
+        if match:
+            return datetime.strptime(match.group(1), "%d.%m.%Y %H:%M")
+    raise ValueError(f"Could not determine the date of chat {path.stem}")
+
+
+def q5_client_message(prices: dict[str, list[dict[str, Any]]], chats_dir: Path) -> str:
+    chat_path = chats_dir / "C0010.txt"
+    chat_timestamp = chat_first_timestamp(chat_path)
+    chat_date = chat_timestamp.date()
+    period = next(
+        (item for item in prices["SOB-ZH-01"]
+         if item["from"] <= chat_date and (item["to"] is None or chat_date <= item["to"])),
+        None,
+    )
+    if period is None:
+        raise ValueError(f"No sable-vest price available on {chat_date}")
+    low = period["minimum"]
+    high = period["recommended"]
     return (
         "Марина: Понимаю Вас — ехать через весь город, не зная бюджета, действительно "
         "неудобно. Сразу сориентирую: жилеты из натурального соболя стоят "
         f"примерно от {format_rub(low)} до {format_rub(high)} ₽; точная стоимость зависит "
-        "от модели, длины и выбранной отделки."
-        f"{order_detail} Если этот диапазон Вам подходит, с удовольствием заранее "
+        f"от модели, длины и выбранной отделки. Это ориентир по прайсу на "
+        f"{chat_date.strftime('%d.%m.%Y')}."
+        " Если этот диапазон Вам подходит, с удовольствием заранее "
         "подготовлю подходящие варианты и согласую удобное время. За один визит Вы "
         "сможете примерить несколько моделей, сравнить мех и посадку, а также обсудить "
         "индивидуальные мерки — без обязательства принимать решение сразу."
@@ -492,7 +533,9 @@ def write_outputs(data_dir: Path, output_dir: Path, template_path: Path) -> dict
     for payment in read_csv_dicts(data_dir / "02_bank_statement_rub.csv", "cp1251"):
         if payment.get("Тип", "").strip().casefold() != "поступление":
             continue
-        amount = parse_decimal(payment.get("Сумма", ""))
+        amount = parse_decimal(payment.get("Сумма", ""), field="bank payment amount")
+        if amount < ZERO:
+            raise ValueError(f"Incoming payment cannot be negative: {payment!r}")
         linked = extract_payment_order_ids(payment.get("Назначение платежа", ""), order_ids)
         incoming.append((payment, linked, amount))
         paid_orders.update(linked)
@@ -525,11 +568,17 @@ def write_outputs(data_dir: Path, output_dir: Path, template_path: Path) -> dict
             violation_shortfall += (minimum - after_discount) * row["_quantity"]
             violations.append((manager, minimum - after_discount))
 
+    if missing_price:
+        raise ValueError(f"Missing historical prices for CRM rows: {dict(missing_price)}")
+    if unknown_managers:
+        raise ValueError(f"Unmapped manager aliases in price violations: {dict(unknown_managers)}")
+
     chats_dir = data_dir / "chats"
     chat_files = sorted(chats_dir.glob("C*.txt"))
     if len(chat_files) != 150:
         raise ValueError(f"Expected 150 chat files in {chats_dir}, found {len(chat_files)}")
-    q4_ids = [chat_id for path in chat_files for chat_id, bad_order in [analyze_chat(path)] if bad_order]
+    chat_audit = [analyze_chat(path) for path in chat_files]
+    q4_ids = [str(item["chat_id"]) for item in chat_audit if item["violation"]]
 
     template = json.loads(template_path.read_text(encoding="utf-8-sig"))
     required_keys = [
@@ -550,16 +599,18 @@ def write_outputs(data_dir: Path, output_dir: Path, template_path: Path) -> dict
         "q3_price_violation_lines_total": sum(violations_by_manager.values()),
         "q3_price_violation_lines_by_manager": dict(sorted(violations_by_manager.items())),
         "q4_chats_meeting_before_price": q4_ids,
-        "run_command": "python solve.py",
+        "run_command": "python src\\solve.py",
         "notes": (
             "Дубли строк удалены по паре «номер заказа + № строки» с выбором наиболее поздней "
             "выгрузки; серийные Excel-даты преобразованы в календарные. Платёж считается "
-            "связанным только при наличии в назначении явного номера/кода существующего заказа; "
-            "сумма счёта или дата сами по себе не считаются номером заказа. Старые артикулы "
-            "сопоставлены с новыми по листу «Переименования», цены выбраны по включительным "
-            "границам интервала. В Q4 учитываются только реплики менеджера; числовая сумма "
-            "считается ценой при указании валюты/единицы или ценового слова. Скидка в процентах "
-            "применяется к сумме строки, скидка без «%» вычитается из суммы всей строки."
+            "связанным только при наличии в назначении явного номера заказа или кода A-...; "
+            "номер счёта, дата и сумма сами по себе не считаются номером заказа. Старые артикулы "
+            "сопоставлены с новыми по справочнику; дата перехода проверяется на наличие цены "
+            "для нового артикула. Цены выбраны по включительным границам интервала. В Q4 "
+            "учитываются только реплики менеджера, а первые найденные события сохраняются в "
+            "output/q4_chat_audit.csv для проверки. Для ответа C0010 используется прайс на дату "
+            "переписки, без данных о более позднем заказе. Скидка в процентах применяется к "
+            "сумме строки, скидка без «%» вычитается из суммы всей строки."
         ),
     })
     if set(result) != set(required_keys):
@@ -589,22 +640,31 @@ def write_outputs(data_dir: Path, output_dir: Path, template_path: Path) -> dict
     )
     (output_dir / "management_memo.md").write_text(memo, encoding="utf-8")
 
-    client_message = q5_client_message(prices, clean_rows)
+    client_message = q5_client_message(prices, chats_dir)
     (output_dir / "client_message_C0010.txt").write_text(client_message + "\n", encoding="utf-8")
+    with (output_dir / "q4_chat_audit.csv").open("w", encoding="utf-8-sig", newline="") as audit_file:
+        writer = csv.DictWriter(
+            audit_file,
+            fieldnames=[
+                "chat_id", "violation", "first_invitation_at", "first_invitation_text",
+                "first_price_at", "first_price_text",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(chat_audit)
 
     validation_notes = (
-        "# Проверка решения\n\n"
-        "Решение подготовлено с помощью AI-ассистента и проверено на исходных файлах. "
-        "При сверке подтверждены кодировка CP1251 банковской выписки, скрытое состояние листа "
-        "«Прайс_история» и смешанные форматы дат и скидок. В Q4 отделены реплики менеджера "
-        "от реплик клиента, поэтому суммы, названные клиентом, не засчитываются как озвученная "
-        "менеджером цена; хронология сопоставляется по временным меткам. Отдельно проверен "
-        "чат C0010: приглашение на примерку предшествует озвучиванию цены, а в записи чата "
-        "клиентка как раз просит сначала назвать бюджет.\n\n"
-        "При воспроизведении результаты сверены с шаблоном JSON, числом исходных строк/чатов "
-        "и повторным запуском скрипта; исходные файлы не изменяются. Цена в сообщении клиентке "
-        "рассчитана из CRM-записи заказа A-00702 и актуального для последнего периода диапазона "
-        "цен справочника."
+        "# Проверка и допущения\n\n"
+        "Банковские строки читаются в CP1251; строки с назначением вида «счёт №...», "
+        "«по счёту №...» не связываются с заказом без отдельного номера заказа. Для Q4 "
+        "в output/q4_chat_audit.csv записаны первые найденные менеджерские приглашение и "
+        "озвучивание цены с временными метками и исходным текстом. Проверяйте эти реплики "
+        "для пограничных формулировок: эвристический поиск по тексту не заменяет ручную "
+        "проверку. Ответ для C0010 использует исторический диапазон прайса на дату чата "
+        f"({chat_first_timestamp(chats_dir / 'C0010.txt').strftime('%d.%m.%Y')}); "
+        "CRM-заказ, созданный позднее переписки, "
+        "в сообщение не включается. Пустые и некорректные обязательные числовые поля приводят "
+        "к ошибке вместо подстановки нуля. Исходные файлы не изменяются."
     )
     (output_dir / "ai_validation_notes.md").write_text(validation_notes + "\n", encoding="utf-8")
 
@@ -612,10 +672,11 @@ def write_outputs(data_dir: Path, output_dir: Path, template_path: Path) -> dict
         print(f"Warning: unmapped manager aliases: {dict(unknown_managers)}", file=sys.stderr)
     if missing_price:
         print(f"Warning: no historical price match for SKUs: {dict(missing_price)}", file=sys.stderr)
-    print(f"Created {answers_path}")
-    print(f"Created {output_dir / 'management_memo.md'}")
-    print(f"Created {output_dir / 'client_message_C0010.txt'}")
-    print(f"Created {output_dir / 'ai_validation_notes.md'}")
+    print(f"Created {answers_path}", file=sys.stderr)
+    print(f"Created {output_dir / 'management_memo.md'}", file=sys.stderr)
+    print(f"Created {output_dir / 'client_message_C0010.txt'}", file=sys.stderr)
+    print(f"Created {output_dir / 'ai_validation_notes.md'}", file=sys.stderr)
+    print(f"Created {output_dir / 'q4_chat_audit.csv'}", file=sys.stderr)
     return result
 
 
@@ -625,19 +686,19 @@ def main() -> int:
         "data_dir", nargs="?", type=Path,
         help="directory containing the source files (default: ./Initial project data)",
     )
-    parser.add_argument(
-        "--output", type=Path, default=Path(__file__).resolve().parent / "output",
-        help="directory for generated files (default: ./output)",
-    )
+    parser.add_argument("--output", type=Path, help="directory for generated files")
     args = parser.parse_args()
-    root = Path(__file__).resolve().parent
+    script_dir = Path(__file__).resolve().parent
+    root = script_dir if (script_dir / "Initial project data").is_dir() else script_dir.parent
     data_dir = (args.data_dir or root / "Initial project data").resolve()
+    output_dir = (args.output or root / "output").resolve()
     template_path = data_dir / "answers_template.json"
     try:
-        write_outputs(data_dir, args.output.resolve(), template_path)
+        result = write_outputs(data_dir, output_dir, template_path)
     except (OSError, ValueError, KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 
